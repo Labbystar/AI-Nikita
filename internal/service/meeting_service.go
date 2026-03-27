@@ -82,6 +82,10 @@ func (s *MeetingService) FinalizeMeeting(ctx context.Context, meetingID string) 
 		return "", err
 	}
 
+	if (meeting.Transcript == nil || strings.TrimSpace(*meeting.Transcript) == "") && len(items) == 0 {
+		return "", fmt.Errorf("недостаточно данных для протокола: сначала загрузите запись или добавьте заметки")
+	}
+
 	summary, protocol, extractedActions, err := s.protocols.BuildProtocol(ctx, meeting, participants, items)
 	if err != nil {
 		return "", err

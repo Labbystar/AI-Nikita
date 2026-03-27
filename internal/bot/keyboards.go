@@ -37,6 +37,18 @@ func MeetingMenu() tgbotapi.ReplyKeyboardMarkup {
 	return kb
 }
 
+func UploadMeetingMenu() tgbotapi.ReplyKeyboardMarkup {
+	kb := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Загрузить аудио"),
+			tgbotapi.NewKeyboardButton("Мои встречи"),
+		),
+	)
+	kb.ResizeKeyboard = true
+	kb.OneTimeKeyboard = false
+	return kb
+}
+
 func PlannerButton() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
