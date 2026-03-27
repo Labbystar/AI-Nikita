@@ -2,27 +2,36 @@ package bot
 
 import tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
-func mainMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Создать встречу", "meeting:new"),
-			tgbotapi.NewInlineKeyboardButtonData("Мои встречи", "meeting:list"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Завершить активную", "meeting:finish"),
+func MainMenu() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Создать встречу"),
+			tgbotapi.NewKeyboardButton("Мои встречи"),
 		),
 	)
 }
 
-func sourceKeyboard() tgbotapi.InlineKeyboardMarkup {
+func MeetingMenu() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Заметка"),
+			tgbotapi.NewKeyboardButton("Решение"),
+			tgbotapi.NewKeyboardButton("Поручение"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Загрузить аудио"),
+			tgbotapi.NewKeyboardButton("Сформировать протокол"),
+		),
+	)
+}
+
+func PlannerButton() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Zoom", "source:zoom"),
-			tgbotapi.NewInlineKeyboardButtonData("Телемост", "source:telemost"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Оффлайн", "source:offline"),
-			tgbotapi.NewInlineKeyboardButtonData("Загрузка записи", "source:upload"),
+			tgbotapi.NewInlineKeyboardButtonURL(
+				"Создать задачу",
+				"https://t.me/napomnimnevajnoe_bot",
+			),
 		),
 	)
 }
