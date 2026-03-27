@@ -61,7 +61,6 @@ func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
-	// Сначала обрабатываем нажатия кнопок. Тогда новый клик не запишется как значение предыдущего шага.
 	if isMenuButton(text) {
 		state.PendingAction = ""
 
@@ -189,6 +188,9 @@ func (h *Handler) handleCallback(ctx context.Context, cq *tgbotapi.CallbackQuery
 	case strings.HasPrefix(cq.Data, "meeting:open:"):
 		meetingID := strings.TrimPrefix(cq.Data, "meeting:open:")
 		h.openMeeting(ctx, chatID, meetingID)
+	case strings.HasPrefix(cq.Data, "meeting:protocol:"):
+		meetingID := strings.TrimPrefix(cq.Data, "meeting:protocol:")
+		h.sendProtocolFile(ctx, chatID, meetingID)
 	default:
 		h.reply(chatID, "Неизвестное действие.")
 	}
@@ -215,7 +217,7 @@ func (h *Handler) createMeetingWithTitle(ctx context.Context, msg *tgbotapi.Mess
 			"Встреча создана.\n\nНазвание: %s\nID: %s\nИсточник: %s\n\nТеперь просто отправьте запись. После расшифровки я сразу соберу протокол.",
 			meeting.Title,
 			meeting.ID,
-			meeting.SourceType,
+			sourceLabel(meeting.SourceType),
 		))
 		msgOut.ReplyMarkup = UploadMeetingMenu()
 		h.send(msgOut)
@@ -226,7 +228,7 @@ func (h *Handler) createMeetingWithTitle(ctx context.Context, msg *tgbotapi.Mess
 		"Встреча создана.\n\nНазвание: %s\nID: %s\nИсточник: %s\n\nЧто можно сделать дальше:\n• добавить участника\n• добавить заметку\n• добавить решение\n• добавить поручение\n• загрузить аудио\n• сформировать протокол",
 		meeting.Title,
 		meeting.ID,
-		meeting.SourceType,
+		sourceLabel(meeting.SourceType),
 	)
 
 	if source == domain.SourceOffline {
@@ -417,10 +419,10 @@ func (h *Handler) showMeetingsList(ctx context.Context, chatID int64, telegramUs
 	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(meetings))
 	for _, meeting := range meetings {
 		title := meeting.Title
-		if len(title) > 28 {
-			title = title[:28] + "…"
+		if len(title) > 24 {
+			title = title[:24] + "…"
 		}
-		label := fmt.Sprintf("%s | %s | %s", meeting.CreatedAt.Format("02.01"), meeting.Status, title)
+		label := fmt.Sprintf("%s | %s | %s", meeting.CreatedAt.Format("02.01"), statusLabel(meeting.Status), title)
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(label, "meeting:open:"+meeting.ID),
 		))
@@ -442,44 +444,132 @@ func (h *Handler) openMeeting(ctx context.Context, chatID int64, meetingID strin
 		return
 	}
 
-	transcriptStatus := "нет"
+	transcriptStatus := "Нет"
 	if meeting.Transcript != nil && strings.TrimSpace(*meeting.Transcript) != "" {
-		transcriptStatus = "есть"
+		transcriptStatus = "Есть"
 	}
-	protocolStatus := "нет"
+	protocolStatus := "Нет"
 	if meeting.ProtocolText != nil && strings.TrimSpace(*meeting.ProtocolText) != "" {
-		protocolStatus = "есть"
+		protocolStatus = "Есть"
 	}
 
-	text := fmt.Sprintf(
-		"Карточка встречи\n\nНазвание: %s\nID: %s\nИсточник: %s\nСтатус: %s\nСоздана: %s\nTranscript: %s\nПротокол: %s",
+	text := fmt.Sprintf(`Карточка встречи
+
+Название: %s
+ID встречи: %s
+Источник: %s
+Статус: %s
+Дата создания: %s
+Расшифровка: %s
+Протокол: %s`,
 		meeting.Title,
 		meeting.ID,
-		meeting.SourceType,
-		meeting.Status,
+		sourceLabel(meeting.SourceType),
+		statusLabel(meeting.Status),
 		meeting.CreatedAt.Format("02.01.2006 15:04"),
 		transcriptStatus,
 		protocolStatus,
 	)
+
+	var inlineRows [][]tgbotapi.InlineKeyboardButton
+	if protocolStatus == "Есть" {
+		inlineRows = append(inlineRows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Скачать протокол", "meeting:protocol:"+meeting.ID),
+		))
+	}
 
 	st := h.state.Get(chatID)
 	if meeting.Status != domain.MeetingFinished {
 		st.DraftMeetingID = meeting.ID
 		st.DraftSource = string(meeting.SourceType)
 		st.AwaitingUpload = meeting.SourceType == domain.SourceUpload
+
 		msg := tgbotapi.NewMessage(chatID, text+"\n\nЭта встреча установлена как активная.")
-		if meeting.SourceType == domain.SourceUpload {
-			msg.ReplyMarkup = UploadMeetingMenu()
-		} else {
-			msg.ReplyMarkup = MeetingMenu()
+		if len(inlineRows) > 0 {
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(inlineRows...)
 		}
 		h.send(msg)
+
+		followUp := tgbotapi.NewMessage(chatID, "Доступные действия для активной встречи:")
+		if meeting.SourceType == domain.SourceUpload {
+			followUp.ReplyMarkup = UploadMeetingMenu()
+		} else {
+			followUp.ReplyMarkup = MeetingMenu()
+		}
+		h.send(followUp)
 		return
 	}
 
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ReplyMarkup = MainMenu()
+	if len(inlineRows) > 0 {
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(inlineRows...)
+	} else {
+		msg.ReplyMarkup = MainMenu()
+	}
 	h.send(msg)
+}
+
+func (h *Handler) sendProtocolFile(ctx context.Context, chatID int64, meetingID string) {
+	meeting, err := h.meetings.GetMeeting(ctx, meetingID)
+	if err != nil {
+		h.reply(chatID, "Не удалось получить встречу: "+err.Error())
+		return
+	}
+	if meeting.ProtocolText == nil || strings.TrimSpace(*meeting.ProtocolText) == "" {
+		h.reply(chatID, "У этой встречи ещё нет протокола.")
+		return
+	}
+
+	filename := safeFileName(meeting.Title)
+	if filename == "" {
+		filename = "protokol-vstrechi"
+	}
+	filename += ".txt"
+
+	doc := tgbotapi.NewDocument(chatID, tgbotapi.FileBytes{
+		Name:  filename,
+		Bytes: []byte(*meeting.ProtocolText),
+	})
+	doc.Caption = "Протокол встречи: " + meeting.Title
+	h.send(doc)
+}
+
+func sourceLabel(source domain.MeetingSource) string {
+	switch source {
+	case domain.SourceZoom:
+		return "Zoom"
+	case domain.SourceTelemost:
+		return "Телемост"
+	case domain.SourceOffline:
+		return "Оффлайн"
+	case domain.SourceUpload:
+		return "Загрузка записи"
+	default:
+		return string(source)
+	}
+}
+
+func statusLabel(status domain.MeetingStatus) string {
+	switch status {
+	case domain.MeetingDraft:
+		return "Черновик"
+	case domain.MeetingInProgress:
+		return "Активная"
+	case domain.MeetingFinished:
+		return "Завершена"
+	default:
+		return string(status)
+	}
+}
+
+func safeFileName(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	replacer := strings.NewReplacer(
+		"/", "-", "\\", "-", ":", "-", "*", "", "?", "", `"`, "", "<", "", ">", "", "|", "",
+	)
+	s = replacer.Replace(s)
+	s = strings.ReplaceAll(s, " ", "-")
+	return s
 }
 
 func (h *Handler) reply(chatID int64, text string) {
