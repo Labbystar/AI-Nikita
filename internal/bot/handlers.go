@@ -21,7 +21,11 @@ type Handler struct {
 }
 
 func NewHandler(bot *tgbotapi.BotAPI, meetings *service.MeetingService, state *StateStore) *Handler {
-	return &Handler{bot: bot, meetings: meetings, state: state}
+	return &Handler{
+		bot:      bot,
+		meetings: meetings,
+		state:    state,
+	}
 }
 
 func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
@@ -29,105 +33,133 @@ func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		h.handleCallback(ctx, update.CallbackQuery)
 		return
 	}
-	if update.Message != nil {
 
-	text := update.Message.Text
-
-	switch text {
-
-	case "/start":
-		msg := tgbotapi.NewMessage(chatID, "Выбери действие:")
-		msg.ReplyMarkup = MainMenu()
-		b.bot.Send(msg)
-
-	case "Создать встречу":
-		b.meetingService.CreateMeeting(chatID)
-		msg := tgbotapi.NewMessage(chatID, "Встреча создана")
-		msg.ReplyMarkup = MeetingMenu()
-		b.bot.Send(msg)
-
-	case "Мои встречи":
-		list := b.meetingService.ListMeetings(chatID)
-		msg := tgbotapi.NewMessage(chatID, list)
-		b.bot.Send(msg)
-
-	case "Заметка":
-		b.state.Set(chatID, "note")
-		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь текст заметки"))
-
-	case "Решение":
-		b.state.Set(chatID, "decision")
-		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь решение"))
-
-	case "Поручение":
-		b.state.Set(chatID, "action")
-		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь поручение"))
-
-	case "Сформировать протокол":
-		protocol := b.meetingService.BuildProtocol(chatID)
-		msg := tgbotapi.NewMessage(chatID, protocol)
-		msg.ReplyMarkup = PlannerButton()
-		b.bot.Send(msg)
-
+	if update.Message == nil {
 		return
 	}
 
-	// обработка текста по состоянию
-	state := b.state.Get(chatID)
-
-	switch state {
-	case "note":
-		b.meetingService.AddNote(chatID, text)
-	case "decision":
-		b.meetingService.AddDecision(chatID, text)
-	case "action":
-		b.meetingService.AddAction(chatID, text)
-	}
-}
-func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
+	msg := update.Message
 	chatID := msg.Chat.ID
 	state := h.state.Get(chatID)
-	cmd := msg.Command()
-	args := strings.TrimSpace(msg.CommandArguments())
 
-	switch cmd {
-	case "start":
-		m := tgbotapi.NewMessage(chatID, "Meeting Assistant. Создайте встречу, выберите источник и после встречи получите протокол.")
-		m.ReplyMarkup = mainMenuKeyboard()
-		h.send(m)
-	case "new_meeting":
+	// Команды оставляем как резерв.
+	if msg.IsCommand() {
+		h.handleCommand(ctx, msg)
+		return
+	}
+
+	// Аудио / voice / документ с аудио
+	if msg.Audio != nil || msg.Voice != nil || msg.Document != nil {
+		h.handleAudioUpload(ctx, msg, state)
+		return
+	}
+
+	text := strings.TrimSpace(msg.Text)
+	if text == "" {
+		return
+	}
+
+	// Сценарии ввода по состоянию.
+	switch state.PendingAction {
+	case "awaiting_title":
+		h.createMeetingWithTitle(ctx, msg, state)
+		return
+	case "awaiting_participant":
+		h.addParticipant(ctx, msg, state)
+		return
+	case "awaiting_note":
+		h.addTypedItem(ctx, chatID, state, domain.ItemNote, text)
+		state.PendingAction = ""
+		h.replyWithMeetingMenu(chatID, "Заметка сохранена.")
+		return
+	case "awaiting_decision":
+		h.addTypedItem(ctx, chatID, state, domain.ItemDecision, text)
+		state.PendingAction = ""
+		h.replyWithMeetingMenu(chatID, "Решение сохранено.")
+		return
+	case "awaiting_action":
+		h.addActionSimple(ctx, chatID, state, text)
+		state.PendingAction = ""
+		h.replyWithMeetingMenu(chatID, "Поручение сохранено.")
+		return
+	}
+
+	// Кнопочный UX.
+	switch text {
+	case "Создать встречу":
 		state.PendingAction = "awaiting_source"
 		m := tgbotapi.NewMessage(chatID, "Выберите источник встречи:")
 		m.ReplyMarkup = sourceKeyboard()
 		h.send(m)
-	case "my_meetings":
-		meetings, err := h.meetings.ListMeetings(ctx, msg.From.ID, 10)
-		if err != nil {
-			h.reply(chatID, "Не удалось загрузить встречи: "+err.Error())
+		return
+
+	case "Мои встречи":
+		h.showMeetingsList(ctx, chatID, msg.From.ID)
+		return
+
+	case "Заметка":
+		if state.DraftMeetingID == "" {
+			h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
 			return
 		}
-		if len(meetings) == 0 {
-			h.reply(chatID, "У вас пока нет встреч.")
+		state.PendingAction = "awaiting_note"
+		h.reply(chatID, "Отправьте текст заметки одним сообщением.")
+		return
+
+	case "Решение":
+		if state.DraftMeetingID == "" {
+			h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
 			return
 		}
-		var lines []string
-		for _, meeting := range meetings {
-			lines = append(lines, fmt.Sprintf("• %s [%s] (%s) id=%s", meeting.Title, meeting.SourceType, meeting.Status, meeting.ID))
+		state.PendingAction = "awaiting_decision"
+		h.reply(chatID, "Отправьте текст решения одним сообщением.")
+		return
+
+	case "Поручение":
+		if state.DraftMeetingID == "" {
+			h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
+			return
 		}
-		h.reply(chatID, strings.Join(lines, "\n"))
-	case "note":
-		h.addTypedItem(ctx, chatID, state, domain.ItemNote, args)
-	case "decision":
-		h.addTypedItem(ctx, chatID, state, domain.ItemDecision, args)
-	case "action":
-		h.addActionItem(ctx, chatID, state, args)
-	case "finish":
+		state.PendingAction = "awaiting_action"
+		h.reply(chatID, "Отправьте текст поручения одним сообщением.\n\nЕсли знаете срок или ответственного, можно написать так:\nФИО | срок | текст")
+		return
+
+	case "Загрузить аудио":
+		if state.DraftMeetingID == "" {
+			h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
+			return
+		}
+		h.reply(chatID, "Отправьте audio, voice или документ с аудио.")
+		return
+
+	case "Сформировать протокол":
 		h.finishMeeting(ctx, chatID, state)
+		return
+	}
+
+	// Если встреча активна и кнопка не нажата — считаем это добавлением участника.
+	if state.DraftMeetingID != "" {
+		h.addParticipant(ctx, msg, state)
+		return
+	}
+
+	h.replyWithMainMenu(chatID, "Выберите действие:")
+}
+
+func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	state := h.state.Get(chatID)
+	cmd := msg.Command()
+
+	switch cmd {
+	case "start":
+		h.state.Reset(chatID)
+		h.replyWithMainMenu(chatID, "Meeting Assistant.\nСоздайте встречу, выберите источник и после встречи получите протокол.")
 	case "cancel":
 		h.state.Reset(chatID)
-		h.reply(chatID, "Текущий сценарий сброшен.")
+		h.replyWithMainMenu(chatID, "Текущий сценарий сброшен.")
 	default:
-		h.reply(chatID, "Неизвестная команда.")
+		h.reply(chatID, "Используйте кнопки меню.")
 	}
 }
 
@@ -136,42 +168,34 @@ func (h *Handler) handleCallback(ctx context.Context, cq *tgbotapi.CallbackQuery
 	state := h.state.Get(chatID)
 	_ = h.answerCallback(cq.ID)
 
-	switch cq.Data {
-	case "meeting:new":
-		state.PendingAction = "awaiting_source"
-		m := tgbotapi.NewMessage(chatID, "Выберите источник встречи:")
-		m.ReplyMarkup = sourceKeyboard()
-		h.send(m)
-	case "meeting:list":
-		meetings, err := h.meetings.ListMeetings(ctx, cq.From.ID, 10)
-		if err != nil {
-			h.reply(chatID, "Не удалось загрузить встречи: "+err.Error())
-			return
-		}
-		if len(meetings) == 0 {
-			h.reply(chatID, "У вас пока нет встреч.")
-			return
-		}
-		var lines []string
-		for _, meeting := range meetings {
-			lines = append(lines, fmt.Sprintf("• %s [%s] (%s) id=%s", meeting.Title, meeting.SourceType, meeting.Status, meeting.ID))
-		}
-		h.reply(chatID, strings.Join(lines, "\n"))
-	case "meeting:finish":
-		h.finishMeeting(ctx, chatID, state)
-	case "source:zoom", "source:telemost", "source:offline", "source:upload":
-		state.DraftSource = strings.TrimPrefix(cq.Data, "source:")
+	data := cq.Data
+
+	switch {
+	case data == "source:zoom" || data == "source:telemost" || data == "source:offline" || data == "source:upload":
+		state.DraftSource = strings.TrimPrefix(data, "source:")
 		state.PendingAction = "awaiting_title"
-		h.reply(chatID, "Введите название встречи одним сообщением.")
-	default:
-		h.reply(chatID, "Неизвестное действие.")
+
+		m := tgbotapi.NewMessage(chatID, "Введите название встречи одним сообщением.")
+		m.ReplyMarkup = MainMenu()
+		h.send(m)
+		return
+
+	case strings.HasPrefix(data, "meeting:open:"):
+		meetingID := strings.TrimPrefix(data, "meeting:open:")
+		h.openMeeting(ctx, chatID, meetingID)
+		return
 	}
 }
 
 func (h *Handler) createMeetingWithTitle(ctx context.Context, msg *tgbotapi.Message, state *SessionState) {
 	source := domain.MeetingSource(state.DraftSource)
+	if source == "" {
+		h.reply(msg.Chat.ID, "Сначала выберите источник встречи.")
+		return
+	}
+
 	meeting, err := h.meetings.CreateMeeting(ctx, domain.CreateMeetingInput{
-		Title:               msg.Text,
+		Title:               strings.TrimSpace(msg.Text),
 		SourceType:          source,
 		CreatedByTelegramID: msg.From.ID,
 	})
@@ -179,43 +203,55 @@ func (h *Handler) createMeetingWithTitle(ctx context.Context, msg *tgbotapi.Mess
 		h.reply(msg.Chat.ID, "Не удалось создать встречу: "+err.Error())
 		return
 	}
+
 	state.DraftMeetingID = meeting.ID
 	state.PendingAction = "awaiting_participant"
 	state.AwaitingUpload = source == domain.SourceOffline || source == domain.SourceUpload || source == domain.SourceTelemost
 
-	text := fmt.Sprintf("Встреча создана.\nID: %s\nИсточник: %s\n\nТеперь можно:\n- прислать имя участника одним сообщением\n- написать /note\n- написать /decision\n- написать /action ФИО | срок | текст\n- отправить аудио/voice после встречи\n- написать /finish для формирования протокола", meeting.ID, meeting.SourceType)
-	if source == domain.SourceZoom {
-		text += "\n\nДля Zoom можно позже связать встречу по webhook/source_meeting_id."
-	}
-	h.reply(msg.Chat.ID, text)
+	text := fmt.Sprintf(
+		"Встреча создана.\n\nНазвание: %s\nID: %s\nИсточник: %s\n\nЧто можно сделать дальше:\n• добавить участника\n• добавить заметку\n• добавить решение\n• добавить поручение\n• загрузить аудио\n• сформировать протокол",
+		meeting.Title,
+		meeting.ID,
+		meeting.SourceType,
+	)
+
+	m := tgbotapi.NewMessage(msg.Chat.ID, text)
+	m.ReplyMarkup = MeetingMenu()
+	h.send(m)
 }
 
 func (h *Handler) addParticipant(ctx context.Context, msg *tgbotapi.Message, state *SessionState) {
+	if state.DraftMeetingID == "" {
+		h.reply(msg.Chat.ID, "Нет активной встречи.")
+		return
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		h.reply(msg.Chat.ID, "Имя участника пустое.")
 		return
 	}
-	if strings.HasPrefix(text, "/") {
-		h.handleCommand(ctx, msg)
-		return
-	}
+
 	if err := h.meetings.AddParticipant(ctx, state.DraftMeetingID, text); err != nil {
 		h.reply(msg.Chat.ID, "Не удалось добавить участника: "+err.Error())
 		return
 	}
-	h.reply(msg.Chat.ID, "Участник добавлен. Можно отправить еще одно имя участника, либо перейти к /note, /decision, /action, /finish.")
+
+	state.PendingAction = ""
+	h.replyWithMeetingMenu(msg.Chat.ID, "Участник добавлен.")
 }
 
 func (h *Handler) addTypedItem(ctx context.Context, chatID int64, state *SessionState, itemType domain.ItemType, content string) {
 	if state.DraftMeetingID == "" {
-		h.reply(chatID, "Нет активной встречи. Сначала создайте её через /new_meeting.")
+		h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
 		return
 	}
+
 	if strings.TrimSpace(content) == "" {
 		h.reply(chatID, "Текст пустой.")
 		return
 	}
+
 	if err := h.meetings.AddItem(ctx, domain.CreateItemInput{
 		MeetingID:  state.DraftMeetingID,
 		ItemType:   itemType,
@@ -223,40 +259,51 @@ func (h *Handler) addTypedItem(ctx context.Context, chatID int64, state *Session
 		Confidence: 1,
 	}); err != nil {
 		h.reply(chatID, "Не удалось сохранить элемент: "+err.Error())
-		return
 	}
-	h.reply(chatID, fmt.Sprintf("Сохранено как %s.", itemType))
 }
 
-func (h *Handler) addActionItem(ctx context.Context, chatID int64, state *SessionState, args string) {
+func (h *Handler) addActionSimple(ctx context.Context, chatID int64, state *SessionState, text string) {
 	if state.DraftMeetingID == "" {
-		h.reply(chatID, "Нет активной встречи. Сначала создайте её через /new_meeting.")
+		h.reply(chatID, "Нет активной встречи. Сначала создайте её.")
 		return
 	}
-	parts := strings.SplitN(args, "|", 3)
-	if len(parts) < 3 {
-		h.reply(chatID, "Формат: /action ФИО | срок | текст")
-		return
+
+	var assignedTo *string
+	var deadline *string
+	content := strings.TrimSpace(text)
+
+	parts := strings.SplitN(text, "|", 3)
+	if len(parts) == 3 {
+		a := strings.TrimSpace(parts[0])
+		d := strings.TrimSpace(parts[1])
+		c := strings.TrimSpace(parts[2])
+
+		if a != "" {
+			assignedTo = &a
+		}
+		if d != "" {
+			deadline = &d
+		}
+		if c != "" {
+			content = c
+		}
 	}
-	assignedTo := strings.TrimSpace(parts[0])
-	deadline := strings.TrimSpace(parts[1])
-	content := strings.TrimSpace(parts[2])
-	if content == "" {
+
+	if strings.TrimSpace(content) == "" {
 		h.reply(chatID, "Текст поручения пустой.")
 		return
 	}
+
 	if err := h.meetings.AddItem(ctx, domain.CreateItemInput{
 		MeetingID:  state.DraftMeetingID,
 		ItemType:   domain.ItemAction,
 		Content:    content,
-		AssignedTo: &assignedTo,
-		Deadline:   &deadline,
+		AssignedTo: assignedTo,
+		Deadline:   deadline,
 		Confidence: 1,
 	}); err != nil {
 		h.reply(chatID, "Не удалось сохранить поручение: "+err.Error())
-		return
 	}
-	h.reply(chatID, "Поручение сохранено.")
 }
 
 func (h *Handler) handleAudioUpload(ctx context.Context, msg *tgbotapi.Message, state *SessionState) {
@@ -264,7 +311,10 @@ func (h *Handler) handleAudioUpload(ctx context.Context, msg *tgbotapi.Message, 
 		h.reply(msg.Chat.ID, "Нет активной встречи.")
 		return
 	}
-	var fileID, mimeType string
+
+	var fileID string
+	var mimeType string
+
 	switch {
 	case msg.Audio != nil:
 		fileID = msg.Audio.FileID
@@ -279,11 +329,13 @@ func (h *Handler) handleAudioUpload(ctx context.Context, msg *tgbotapi.Message, 
 		h.reply(msg.Chat.ID, "Поддерживается audio, voice или document с аудио.")
 		return
 	}
+
 	url, err := h.bot.GetFileDirectURL(fileID)
 	if err != nil {
 		h.reply(msg.Chat.ID, "Не удалось получить файл из Telegram: "+err.Error())
 		return
 	}
+
 	if err := h.meetings.AddArtifact(ctx, domain.CreateArtifactInput{
 		MeetingID:    state.DraftMeetingID,
 		ArtifactType: domain.ArtifactAudio,
@@ -295,21 +347,23 @@ func (h *Handler) handleAudioUpload(ctx context.Context, msg *tgbotapi.Message, 
 		return
 	}
 
-	statusMsg := tgbotapi.NewMessage(msg.Chat.ID, "Файл получен. Пытаюсь сделать расшифровку...")
-	h.send(statusMsg)
+	h.reply(msg.Chat.ID, "Файл получен. Пытаюсь сделать расшифровку...")
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
+
 	transcript, err := h.meetings.AddTranscriptFromFileURL(ctx, state.DraftMeetingID, url, mimeType)
 	if err != nil {
-		h.reply(msg.Chat.ID, "Файл сохранен, но расшифровка не удалась: "+err.Error())
+		h.reply(msg.Chat.ID, "Файл сохранён, но расшифровка не удалась: "+err.Error())
 		return
 	}
+
 	preview := transcript
 	if len(preview) > 700 {
 		preview = preview[:700] + "\n..."
 	}
-	h.reply(msg.Chat.ID, "Расшифровка готова:\n\n"+preview+"\n\nТеперь можно писать /finish")
+
+	h.replyWithMeetingMenu(msg.Chat.ID, "Расшифровка готова:\n\n"+preview)
 }
 
 func (h *Handler) finishMeeting(ctx context.Context, chatID int64, state *SessionState) {
@@ -317,22 +371,130 @@ func (h *Handler) finishMeeting(ctx context.Context, chatID int64, state *Sessio
 		h.reply(chatID, "Нет активной встречи.")
 		return
 	}
+
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+
 	protocol, err := h.meetings.FinalizeMeeting(ctx, state.DraftMeetingID)
 	if err != nil {
 		h.reply(chatID, "Не удалось сформировать протокол: "+err.Error())
 		return
 	}
-	h.state.Reset(chatID)
+
+	state.DraftMeetingID = ""
+	state.PendingAction = ""
+	state.DraftSource = ""
+	state.AwaitingUpload = false
+
 	if len(protocol) > 3500 {
 		protocol = protocol[:3500] + "\n..."
 	}
-	h.reply(chatID, "Протокол сформирован:\n\n"+protocol)
+
+	msg := tgbotapi.NewMessage(chatID, "Протокол сформирован:\n\n"+protocol)
+	msg.ReplyMarkup = PlannerButton()
+	h.send(msg)
+
+	h.replyWithMainMenu(chatID, "Можно создать новую встречу или открыть список ваших встреч.")
+}
+
+func (h *Handler) showMeetingsList(ctx context.Context, chatID int64, telegramUserID int64) {
+	meetings, err := h.meetings.ListMeetings(ctx, telegramUserID, 10)
+	if err != nil {
+		h.reply(chatID, "Не удалось загрузить встречи: "+err.Error())
+		return
+	}
+
+	if len(meetings) == 0 {
+		h.reply(chatID, "У вас пока нет встреч.")
+		return
+	}
+
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(meetings))
+	for _, meeting := range meetings {
+		title := meeting.Title
+		if len(title) > 28 {
+			title = title[:28] + "…"
+		}
+
+		label := fmt.Sprintf("%s | %s | %s",
+			meeting.CreatedAt.Format("02.01"),
+			meeting.Status,
+			title,
+		)
+
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(label, "meeting:open:"+meeting.ID),
+		))
+	}
+
+	msg := tgbotapi.NewMessage(chatID, "Мои встречи:")
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	h.send(msg)
+}
+
+func (h *Handler) openMeeting(ctx context.Context, chatID int64, meetingID string) {
+	meeting, err := h.meetings.GetMeeting(ctx, meetingID)
+	if err != nil {
+		if IsNotFound(err) {
+			h.reply(chatID, "Встреча не найдена.")
+			return
+		}
+		h.reply(chatID, "Не удалось открыть встречу: "+err.Error())
+		return
+	}
+
+	var transcriptStatus string
+	if meeting.Transcript != nil && strings.TrimSpace(*meeting.Transcript) != "" {
+		transcriptStatus = "есть"
+	} else {
+		transcriptStatus = "нет"
+	}
+
+	var protocolStatus string
+	if meeting.ProtocolText != nil && strings.TrimSpace(*meeting.ProtocolText) != "" {
+		protocolStatus = "есть"
+	} else {
+		protocolStatus = "нет"
+	}
+
+	text := fmt.Sprintf(
+		"Карточка встречи\n\nНазвание: %s\nID: %s\nИсточник: %s\nСтатус: %s\nСоздана: %s\nTranscript: %s\nПротокол: %s",
+		meeting.Title,
+		meeting.ID,
+		meeting.SourceType,
+		meeting.Status,
+		meeting.CreatedAt.Format("02.01.2006 15:04"),
+		transcriptStatus,
+		protocolStatus,
+	)
+
+	if meeting.Status != domain.MeetingFinished {
+		h.state.Get(chatID).DraftMeetingID = meeting.ID
+		msg := tgbotapi.NewMessage(chatID, text+"\n\nЭта встреча установлена как активная.")
+		msg.ReplyMarkup = MeetingMenu()
+		h.send(msg)
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = MainMenu()
+	h.send(msg)
 }
 
 func (h *Handler) reply(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
+	h.send(msg)
+}
+
+func (h *Handler) replyWithMainMenu(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = MainMenu()
+	h.send(msg)
+}
+
+func (h *Handler) replyWithMeetingMenu(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = MeetingMenu()
 	h.send(msg)
 }
 
@@ -349,4 +511,17 @@ func (h *Handler) answerCallback(id string) error {
 
 func IsNotFound(err error) bool {
 	return err == sql.ErrNoRows
+}
+
+func sourceKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Zoom", "source:zoom"),
+			tgbotapi.NewInlineKeyboardButtonData("Телемост", "source:telemost"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Оффлайн", "source:offline"),
+			tgbotapi.NewInlineKeyboardButtonData("Загрузка записи", "source:upload"),
+		),
+	)
 }
