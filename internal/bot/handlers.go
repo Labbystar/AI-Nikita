@@ -29,27 +29,61 @@ func (h *Handler) HandleUpdate(ctx context.Context, update tgbotapi.Update) {
 		h.handleCallback(ctx, update.CallbackQuery)
 		return
 	}
-	if update.Message == nil {
+	if update.Message != nil {
+
+	text := update.Message.Text
+
+	switch text {
+
+	case "/start":
+		msg := tgbotapi.NewMessage(chatID, "Выбери действие:")
+		msg.ReplyMarkup = MainMenu()
+		b.bot.Send(msg)
+
+	case "Создать встречу":
+		b.meetingService.CreateMeeting(chatID)
+		msg := tgbotapi.NewMessage(chatID, "Встреча создана")
+		msg.ReplyMarkup = MeetingMenu()
+		b.bot.Send(msg)
+
+	case "Мои встречи":
+		list := b.meetingService.ListMeetings(chatID)
+		msg := tgbotapi.NewMessage(chatID, list)
+		b.bot.Send(msg)
+
+	case "Заметка":
+		b.state.Set(chatID, "note")
+		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь текст заметки"))
+
+	case "Решение":
+		b.state.Set(chatID, "decision")
+		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь решение"))
+
+	case "Поручение":
+		b.state.Set(chatID, "action")
+		b.bot.Send(tgbotapi.NewMessage(chatID, "Отправь поручение"))
+
+	case "Сформировать протокол":
+		protocol := b.meetingService.BuildProtocol(chatID)
+		msg := tgbotapi.NewMessage(chatID, protocol)
+		msg.ReplyMarkup = PlannerButton()
+		b.bot.Send(msg)
+
 		return
 	}
-	msg := update.Message
-	chatID := msg.Chat.ID
-	state := h.state.Get(chatID)
 
-	switch {
-	case msg.IsCommand():
-		h.handleCommand(ctx, msg)
-	case state.PendingAction == "awaiting_title":
-		h.createMeetingWithTitle(ctx, msg, state)
-	case state.PendingAction == "awaiting_participant":
-		h.addParticipant(ctx, msg, state)
-	case state.AwaitingUpload && (msg.Audio != nil || msg.Voice != nil || msg.Document != nil):
-		h.handleAudioUpload(ctx, msg, state)
-	default:
-		h.reply(chatID, "Не понял сообщение. Используйте меню или команды /note, /decision, /action.")
+	// обработка текста по состоянию
+	state := b.state.Get(chatID)
+
+	switch state {
+	case "note":
+		b.meetingService.AddNote(chatID, text)
+	case "decision":
+		b.meetingService.AddDecision(chatID, text)
+	case "action":
+		b.meetingService.AddAction(chatID, text)
 	}
 }
-
 func (h *Handler) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	state := h.state.Get(chatID)
