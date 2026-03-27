@@ -29,8 +29,8 @@ func Load() (Config, error) {
 		TelegramUseWebhook:    getenvBool("TELEGRAM_USE_WEBHOOK", false),
 		OpenAIAPIKey:          getenv("OPENAI_API_KEY", ""),
 		OpenAIBaseURL:         getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-		OpenAITranscribeModel: getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"),
-		OpenAIChatModel:       getenv("OPENAI_CHAT_MODEL", "gpt-5-mini"),
+		OpenAITranscribeModel: getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1"),
+		OpenAIChatModel:       getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
 		ZoomWebhookSecret:     getenv("ZOOM_WEBHOOK_SECRET", ""),
 		ZoomWebhookEnabled:    getenvBool("ZOOM_WEBHOOK_ENABLED", false),
 	}

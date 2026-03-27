@@ -29,27 +29,17 @@ func (a *App) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	telegramBot.Debug = false
+	log.Printf("authorized on telegram as @%s", telegramBot.Self.UserName)
 
-	log.Printf("Bot started: @%s", telegramBot.Self.UserName)
-
-	// STT
 	var transcriptService service.TranscriptService = &service.StubTranscriptService{}
 	if a.cfg.OpenAIAPIKey != "" {
-		transcriptService = service.NewOpenAITranscriptService(
-			a.cfg.OpenAIAPIKey,
-			a.cfg.OpenAIBaseURL,
-			a.cfg.OpenAITranscribeModel,
-		)
+		transcriptService = service.NewOpenAITranscriptService(a.cfg.OpenAIAPIKey, a.cfg.OpenAIBaseURL, a.cfg.OpenAITranscribeModel)
 	}
 
-	// Protocol
-	var protocolService service.ProtocolService = &service.HeuristicProtocolService{}
+	protocolService := service.ProtocolService(&service.HeuristicProtocolService{})
 	if a.cfg.OpenAIAPIKey != "" {
-		protocolService = service.NewOpenAIProtocolService(
-			a.cfg.OpenAIAPIKey,
-			a.cfg.OpenAIBaseURL,
-			a.cfg.OpenAIChatModel,
-		)
+		protocolService = service.NewOpenAIProtocolService(a.cfg.OpenAIAPIKey, a.cfg.OpenAIBaseURL, a.cfg.OpenAIChatModel)
 	}
 
 	meetingService := service.NewMeetingService(repo, transcriptService, protocolService)
@@ -57,14 +47,16 @@ func (a *App) Run(ctx context.Context) error {
 
 	updateCfg := tgbotapi.NewUpdate(0)
 	updateCfg.Timeout = 30
-
 	updates := telegramBot.GetUpdatesChan(updateCfg)
+
+	log.Println("bot started in polling mode")
 
 	for {
 		select {
 		case update := <-updates:
 			handler.HandleUpdate(ctx, update)
 		case <-ctx.Done():
+			log.Println("shutting down bot")
 			return nil
 		}
 	}

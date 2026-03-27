@@ -119,18 +119,27 @@ func (s *OpenAIProtocolService) BuildProtocol(ctx context.Context, meeting *doma
 	if strings.TrimSpace(s.apiKey) == "" {
 		return s.fallback.BuildProtocol(ctx, meeting, participants, items)
 	}
-	prompt := buildProtocolPrompt(meeting, participants, items)
+
+	systemPrompt := "Ты помощник руководителя и секретарь встреч. Верни управленческий протокол на русском языке. Строго разделяй вывод на блоки: Краткое резюме, Принятые решения, Поручения, Неопределенности и спорные места. Не выдумывай факты. Если срок или ответственный не определены, так и пиши."
+	userPrompt := buildProtocolPrompt(meeting, participants, items)
+
 	payload := map[string]any{
 		"model": s.model,
-		"input": prompt,
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": userPrompt},
+		},
+		"temperature": 0.2,
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/responses", bytes.NewReader(body))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return s.fallback.BuildProtocol(ctx, meeting, participants, items)
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil || resp == nil {
 		return s.fallback.BuildProtocol(ctx, meeting, participants, items)
@@ -140,15 +149,20 @@ func (s *OpenAIProtocolService) BuildProtocol(ctx context.Context, meeting *doma
 	if resp.StatusCode >= 300 {
 		return s.fallback.BuildProtocol(ctx, meeting, participants, items)
 	}
+
 	var parsed struct {
-		OutputText string `json:"output_text"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil || strings.TrimSpace(parsed.OutputText) == "" {
+	if err := json.Unmarshal(respBody, &parsed); err != nil || len(parsed.Choices) == 0 || strings.TrimSpace(parsed.Choices[0].Message.Content) == "" {
 		return s.fallback.BuildProtocol(ctx, meeting, participants, items)
 	}
-	// LLM может красиво оформить, но задачи безопаснее брать из уже структурированных action items.
+
 	summary, _, actionItems, _ := s.fallback.BuildProtocol(ctx, meeting, participants, items)
-	return summary, parsed.OutputText, actionItems, nil
+	return summary, parsed.Choices[0].Message.Content, actionItems, nil
 }
 
 func buildProtocolPrompt(meeting *domain.Meeting, participants []domain.MeetingParticipant, items []domain.MeetingItem) string {
@@ -157,14 +171,10 @@ func buildProtocolPrompt(meeting *domain.Meeting, participants []domain.MeetingP
 		pNames = append(pNames, p.DisplayName)
 	}
 	var lines []string
-	lines = append(lines, "Сформируй управленческий протокол встречи на русском языке.")
-	lines = append(lines, "Нельзя выдумывать ответственных и сроки.")
-	lines = append(lines, "Если информации недостаточно, явно пиши: не удалось надежно определить.")
-	lines = append(lines, "Разделы: Краткое резюме, Решения, Поручения, Риски/спорные места.")
 	lines = append(lines, fmt.Sprintf("Тема: %s", meeting.Title))
 	lines = append(lines, fmt.Sprintf("Источник: %s", meeting.SourceType))
 	lines = append(lines, fmt.Sprintf("Участники: %s", strings.Join(pNames, ", ")))
-	if meeting.Transcript != nil {
+	if meeting.Transcript != nil && strings.TrimSpace(*meeting.Transcript) != "" {
 		lines = append(lines, "Transcript:")
 		lines = append(lines, *meeting.Transcript)
 	}
